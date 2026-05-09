@@ -6,5 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "cognee>=1.0.9",
+    "httpx>=0.28.1",
+    "ragas>=0.4.3",
     "sentence-transformers>=5.4.1",
 ]

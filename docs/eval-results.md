@@ -125,8 +125,6 @@ Cross-document reasoning questions retrieve more context, some of which is less 
  16  T2  1.000  0.951  1.000  1.000  การเกษตรอัจฉริยะ...
 ```
 
-*Note: Per-sample values above are from the v2 run. Values shown are best-effort reconstruction; averages below are definitive.*
-
 ## Averages
 
 | Metric              | v1     | v2     | Delta  |
@@ -161,11 +159,136 @@ The evaluation script was rewritten:
 
 Re-run with: `uv run tests/eval_ragas.py`
 
-## Scripts
+---
+
+# Reference: Cognee Search Types
+
+Cognee v1.0.9 has 15 search types, dispatched via `SearchType` enum.
+
+## Pure vector search (no LLM, no graph)
+
+| SearchType | What it searches | Returns |
+|---|---|---|
+| `CHUNKS` | Vector similarity on `DocumentChunk_text` | Raw document passages |
+| `SUMMARIES` | Vector similarity on `TextSummary_text` | Pre-computed summaries |
+| `CHUNKS_LEXICAL` | Jaccard token similarity over all chunks | Keyword-matched chunks |
+
+## Standard RAG (vector + LLM)
+
+| SearchType | What it does |
+|---|---|
+| `RAG_COMPLETION` | Vector search on chunks → LLM generates answer |
+| `TRIPLET_COMPLETION` | Vector search on pre-embedded triplets → LLM generates answer |
+
+## Graph-based (vector + graph traversal + LLM)
+
+All graph search types use `brute_force_triplet_search()` under the hood: embed query → vector search across 5 collections (Entity, Summary, EntityType, Chunk, EdgeType) → project subgraph → rank triplets by vector distance + graph structure.
+
+| SearchType | What it adds on top of GRAPH_COMPLETION |
+|---|---|
+| `GRAPH_COMPLETION` | Base — hybrid vector + graph triplet retrieval, LLM answer |
+| `GRAPH_COMPLETION_DECOMPOSITION` | LLM breaks query into sub-queries, retrieves triplets per sub-query, merges |
+| `GRAPH_COMPLETION_COT` | Iterative: retrieve → answer → validate → generate follow-up questions → retrieve more → repeat up to 4 rounds |
+| `GRAPH_COMPLETION_CONTEXT_EXTENSION` | Iterative: retrieve → answer → use **answer as new query** → retrieve more → repeat up to 4 rounds |
+| `GRAPH_SUMMARY_COMPLETION` | Same retrieval, but **summarizes** the graph context before sending to LLM |
+| `TEMPORAL` | Extracts time range from query, filters graph events by time, vector-reranks |
+
+## Direct graph query
+
+| SearchType | What it does |
+|---|---|
+| `CYPHER` | Execute raw Cypher query against graph DB |
+| `NATURAL_LANGUAGE` | LLM translates natural language → Cypher → execute (retries up to 3x) |
+
+## Utility
+
+| SearchType | What it does |
+|---|---|
+| `CODING_RULES` | Direct lookup of predefined rule nodesets |
+| `FEELING_LUCKY` | Asks LLM to pick the best SearchType for your query |
+
+## What we use
+
+- `GRAPH_COMPLETION` — gets the RAG response. Most intelligent single-pass search.
+- `CHUNKS` — gets retrieved contexts for Ragas evaluation. Pure vector, raw passages.
+
+Using `CHUNKS` for contexts keeps retrieval quality separate from generation quality in the eval.
+
+---
+
+# Reference: Ragas TestsetGenerator
+
+Ragas has a built-in `TestsetGenerator` that creates QA pairs from source documents — the opposite of `gather_responses.py`.
+
+## gather_responses.py vs TestsetGenerator
+
+| | gather_responses.py | TestsetGenerator |
+|---|---|---|
+| **What it produces** | RAG responses + retrieved contexts | Questions + reference answers |
+| **Input** | Hand-written questions | Source documents |
+| **LLM usage** | Calls your RAG pipeline (cognee) | Calls a separate LLM to generate QA pairs |
+| **Ground truth** | You write it yourself | LLM generates it from source text |
+| **Purpose** | "Run my RAG on known questions, capture what it returns" | "Create test questions I didn't think of" |
+
+## TestsetGenerator pipeline
+
+```
+Source Documents
+    → [Transform] LLM extracts summaries, themes, named entities, embeddings
+    → [KnowledgeGraph] nodes + relationships between chunks
+    → [Persona Generation] LLM creates user personas from clustered summaries
+    → [Scenario Generation] pick chunks, themes, personas, query style/length
+    → [Sample Generation] LLM generates question + ground-truth answer per scenario
+    → Testset (question, reference, reference_contexts, persona, style)
+```
+
+## Question types (Synthesizers)
+
+| Synthesizer | How it picks context | Question style |
+|---|---|---|
+| `SingleHopSpecificQuerySynthesizer` | One chunk with entities | Factual, single-document |
+| `MultiHopSpecificQuerySynthesizer` | Two chunks sharing named entities | Cross-document reasoning |
+| `MultiHopAbstractQuerySynthesizer` | Leiden community detection + concept combinations | Abstract reasoning across documents |
+
+Default distribution: equal weight (1/3 each).
+
+## Why we don't use it yet
+
+We wrote 16 hand-crafted questions because our domain (Thai industry) requires Thai-language questions and reference answers. TestsetGenerator's prompts are in English — it would need prompt adaptation similar to what we did for the eval metrics. Also, for 16 samples the hand-crafted approach gives better control over question quality and difficulty tiers.
+
+---
+
+# Reference: Ragas evaluate() vs Manual Loop
+
+We use a manual concurrent loop (`asyncio.Semaphore(10)` + `asyncio.gather()`) instead of Ragas's built-in `evaluate()` function.
+
+## Why we chose the manual loop
+
+`evaluate()` uses `tqdm` progress bars with `\r` carriage returns, which are invisible in non-TTY output (captured/piped). During testing, `evaluate()` ran for 45+ minutes showing "0/80" despite active processing. The manual loop uses explicit `print()` after each metric/sample, giving real-time visible progress.
+
+## What evaluate() provides that we don't use
+
+| Feature | Why we skip it |
+|---|---|
+| **EvaluationDataset validation** | Our `gather_responses.py` guarantees correct fields. Missing fields would surface immediately at scoring time anyway. Not worth the complexity for 16 hand-crafted samples. |
+| **EvaluationResult with .to_pandas()** | We print a results table and averages. If pandas analysis is needed later, results are just a list of dicts — trivial to add. |
+| **Tracing/cost tracking** | Records every LLM call (prompt, response, latency). Useful for debugging weird scores, but we see individual scores as they print. Cost tracking requires a `token_usage_parser` we never set up. |
+| **Sophisticated retries (tenacity)** | `evaluate()` uses tenacity with jitter + `max_wait`. Our `sleep(2^attempt)` with 3 retries covers transient API blips. For a single-user eval against one endpoint, jitter doesn't matter — no thundering herd. |
+
+## What we get from the manual loop
+
+- Visible per-metric, per-sample progress
+- Full control over concurrency (`Semaphore(10)`)
+- Simple retry with exponential backoff (3 attempts)
+- Direct access to results as list of dicts
+
+---
+
+# Scripts
 
 - `tests/eval_data.py` — shared 16-question dataset
 - `tests/gather_responses.py` — queries cognee, saves to `tests/data/responses.json`
-- `tests/eval_ragas.py` — loads saved responses, runs 5 Ragas metrics (rewritten with proper API)
+- `tests/eval_ragas.py` — loads saved responses, runs 4 Ragas metrics (Thai prompts, concurrent)
 - `tests/prompts/` — saved Thai-adapted prompts (auto-generated on first run)
 
 Usage:

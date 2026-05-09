@@ -7,6 +7,7 @@ Usage:
   2. Evaluate:  uv run tests/eval_ragas.py
 """
 
+import asyncio
 import json
 import math
 import os
@@ -30,9 +31,12 @@ from ragas.metrics._faithfulness import Faithfulness
 from ragas.metrics._answer_relevance import AnswerRelevancy
 from ragas.metrics._context_precision import ContextPrecision
 from ragas.metrics._context_recall import ContextRecall
-from ragas.metrics._factual_correctness import FactualCorrectness
+# FactualCorrectness disabled — 4x LLM calls per sample, expensive.
+# Use for final eval only: from ragas.metrics._factual_correctness import FactualCorrectness
 
 RESPONSES_FILE = Path(__file__).resolve().parent / "data" / "responses.json"
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+MAX_CONCURRENT = 10
 
 
 class LocalEmbeddings(Embeddings):
@@ -59,6 +63,83 @@ class LocalEmbeddings(Embeddings):
         return [d["embedding"] for d in sorted(data["data"], key=lambda x: x["index"])]
 
 
+async def adapt_metrics_to_thai(metrics: list, llm) -> None:
+    """Adapt all metric prompts to Thai, saving for reuse."""
+    PROMPTS_DIR.mkdir(exist_ok=True)
+
+    for metric in metrics:
+        try:
+            adapted = await metric.adapt_prompts(
+                language="thai",
+                llm=llm,
+                adapt_instruction=True,
+            )
+        except Exception:
+            print(f"  {metric.name}: instruction translation failed, adapting examples only...")
+            adapted = await metric.adapt_prompts(
+                language="thai",
+                llm=llm,
+                adapt_instruction=False,
+            )
+        metric.set_prompts(**adapted)
+        metric.save_prompts(str(PROMPTS_DIR))
+        print(f"  Adapted: {metric.name}")
+
+
+def load_adapted_prompts(metrics: list) -> list:
+    """Load previously saved Thai prompts. Returns list of metrics that need adaptation."""
+    if not PROMPTS_DIR.exists():
+        return metrics
+
+    needs_adaptation = []
+    for metric in metrics:
+        try:
+            metric.load_prompts(str(PROMPTS_DIR), language="thai")
+            print(f"  Loaded: {metric.name}")
+        except Exception:
+            needs_adaptation.append(metric)
+    return needs_adaptation
+
+
+async def score_sample(sample_dict: dict, metrics: dict, semaphore: asyncio.Semaphore,
+                       total: int, counter: dict) -> dict:
+    """Score a single sample with all metrics. Uses semaphore for concurrency."""
+    async with semaphore:
+        ragas_sample = SingleTurnSample(
+            user_input=sample_dict["user_input"],
+            response=sample_dict["response"],
+            reference=sample_dict["reference"],
+            retrieved_contexts=sample_dict["retrieved_contexts"],
+        )
+
+        scores = {
+            "id": sample_dict["id"],
+            "tier": sample_dict["tier"],
+            "user_input": sample_dict["user_input"][:60],
+        }
+
+        for metric_name, metric in metrics.items():
+            for attempt in range(3):
+                try:
+                    value = await metric.single_turn_ascore(ragas_sample)
+                    scores[metric_name] = value
+                    if isinstance(value, float) and math.isnan(value):
+                        print(f"    {metric_name}: nan")
+                    else:
+                        print(f"    {metric_name}: {value:.4f}" if isinstance(value, float) else f"    {metric_name}: {value}")
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        print(f"    {metric_name}: ERROR - {e}")
+                        scores[metric_name] = None
+
+        counter["done"] += 1
+        print(f"  [{counter['done']}/{total}] Done")
+        return scores
+
+
 async def main():
     print("=" * 60)
     print("Ragas Evaluation: Thai Industry RAG")
@@ -79,7 +160,7 @@ async def main():
     # Setup evaluator
     ragas_llm = LangchainLLMWrapper(
         ChatOpenAI(
-            model="glm-5.1",
+            model="glm-5-turbo",
             base_url=os.getenv("LLM_ENDPOINT"),
             api_key=os.getenv("LLM_API_KEY"),
             temperature=0,
@@ -98,74 +179,52 @@ async def main():
         "answer_relevancy": AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
         "context_precision": ContextPrecision(llm=ragas_llm),
         "context_recall": ContextRecall(llm=ragas_llm),
-        "factual_correctness": FactualCorrectness(llm=ragas_llm),
     }
 
-    # Score each sample
-    print("\n--- Running Ragas Metrics ---\n")
-    results = []
+    # Adapt prompts to Thai (one-time translation, saved for reuse)
+    print("\n--- Adapting Prompts to Thai ---")
+    needs_adaptation = load_adapted_prompts(list(metrics.values()))
+    if needs_adaptation:
+        print(f"  Adapting {len(needs_adaptation)} metric(s)...")
+        await adapt_metrics_to_thai(needs_adaptation, ragas_llm)
 
-    for sample in samples:
-        i = sample["id"]
-        tier = sample["tier"]
-        query = sample["user_input"]
-        reference = sample["reference"]
-        response = sample["response"]
-        contexts = sample["retrieved_contexts"]
+    # Run all samples concurrently with progress tracking
+    print(f"\n--- Running Ragas Metrics ({MAX_CONCURRENT} concurrent) ---\n")
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    counter = {"done": 0}
 
-        print(f"[{tier}] [{i}/{len(samples)}] Scoring: {query[:50]}...")
+    tasks = [
+        score_sample(s, metrics, semaphore, len(samples), counter)
+        for s in samples
+    ]
+    results = await asyncio.gather(*tasks)
 
-        scores = {"id": i, "tier": tier, "user_input": query[:60]}
-        ragas_sample = SingleTurnSample(
-            user_input=query,
-            response=response,
-            reference=reference,
-            retrieved_contexts=contexts,
-        )
-        for metric_name, metric in metrics.items():
-            try:
-                value = await metric.single_turn_ascore(ragas_sample)
-                scores[metric_name] = value
-                if isinstance(value, float) and math.isnan(value):
-                    print(f"  {metric_name}: nan")
-                else:
-                    print(f"  {metric_name}: {value:.4f}" if isinstance(value, float) else f"  {metric_name}: {value}")
-            except Exception as e:
-                print(f"  {metric_name}: ERROR - {e}")
-                scores[metric_name] = None
-
-        results.append(scores)
-
-    # Print summary
+    # Print results
     print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
     print("=" * 60)
 
-    # Per-sample table
-    print(f"\n{'#':>2} {'Tier':>3} {'Faith':>6} {'AnsR':>6} {'CtxP':>6} {'CtxR':>6} {'Fact':>6}  Question")
-    print("-" * 78)
-    for r in results:
+    print(f"\n{'#':>2} {'Tier':>3} {'Faith':>6} {'AnsR':>6} {'CtxP':>6} {'CtxR':>6}  Question")
+    print("-" * 70)
+    for r in sorted(results, key=lambda x: x["id"]):
         def fmt(v):
             if isinstance(v, float) and math.isnan(v):
                 return "  nan"
             return f"{v:.3f}" if isinstance(v, float) else "  N/A"
         print(f"{r['id']:>2} {r['tier']:>3} {fmt(r.get('faithfulness')):>6} {fmt(r.get('answer_relevancy')):>6} "
-              f"{fmt(r.get('context_precision')):>6} {fmt(r.get('context_recall')):>6} "
-              f"{fmt(r.get('factual_correctness')):>6}  {r['user_input'][:40]}...")
+              f"{fmt(r.get('context_precision')):>6} {fmt(r.get('context_recall')):>6}  {r['user_input'][:40]}...")
 
-    # Averages
     print("\n--- Averages ---")
     for metric_name in metrics:
-        values = [r[metric_name] for r in results if isinstance(r.get(metric_name), (int, float)) and not (isinstance(r[metric_name], float) and math.isnan(r[metric_name]))]
+        values = [r[metric_name] for r in results
+                  if isinstance(r.get(metric_name), (int, float))
+                  and not (isinstance(r[metric_name], float) and math.isnan(r[metric_name]))]
         if values:
             avg = sum(values) / len(values)
             print(f"  {metric_name}: {avg:.4f} ({len(values)}/{len(results)} scored)")
-        else:
-            print(f"  {metric_name}: no scores")
 
     print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

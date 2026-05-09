@@ -260,27 +260,32 @@ We wrote 16 hand-crafted questions because our domain (Thai industry) requires T
 
 # Reference: Ragas evaluate() vs Manual Loop
 
-We use a manual concurrent loop (`asyncio.Semaphore(10)` + `asyncio.gather()`) instead of Ragas's built-in `evaluate()` function.
+## Current approach: manual concurrent loop
 
-## Why we chose the manual loop
+We use a manual concurrent loop (`asyncio.Semaphore(10)` + `asyncio.gather()`) with explicit `print()` for progress. This works well for 16 samples — visible per-metric, per-sample progress, 3 retries per metric, 10 concurrent workers.
 
-`evaluate()` uses `tqdm` progress bars with `\r` carriage returns, which are invisible in non-TTY output (captured/piped). During testing, `evaluate()` ran for 45+ minutes showing "0/80" despite active processing. The manual loop uses explicit `print()` after each metric/sample, giving real-time visible progress.
+## Future approach: evaluate()
 
-## What evaluate() provides that we don't use
+We'll switch to `evaluate()` when scaling past 16 samples or adding FactualCorrectness back. `evaluate()` provides:
+- **EvaluationDataset validation** — Pydantic type coercion + `validate_required_columns()` checks metric requirements before burning LLM credits. Useful for large/dynamic datasets, less necessary for hand-crafted ones.
+- **EvaluationResult with .to_pandas()** — structured results with export to pandas/CSV/JSON. Trivial to add later since results are just a list of dicts.
+- **Tracing/cost tracking** — records every LLM call (prompt, response, latency). Requires a `token_usage_parser` callback.
+- **Tenacity retries** — exponential backoff with jitter + `max_wait` cap. More robust than our `sleep(2^attempt)` with 3 retries.
 
-| Feature | Why we skip it |
+### The tqdm progress issue (solved)
+
+`evaluate()` uses `tqdm` progress bars with `\r` carriage returns. These are invisible in non-TTY environments (captured/piped output, IDE terminals). During testing, `evaluate()` ran 45+ minutes showing "0/80" despite active processing.
+
+**Solution**: run `uv run tests/eval_ragas.py` in a real terminal (not through VSCode's captured output). With a real TTY, `tqdm` renders normally. No code changes needed.
+
+## evaluate() features we don't need now
+
+| Feature | Why we skip it (for now) |
 |---|---|
-| **EvaluationDataset validation** | Our `gather_responses.py` guarantees correct fields. Missing fields would surface immediately at scoring time anyway. Not worth the complexity for 16 hand-crafted samples. |
-| **EvaluationResult with .to_pandas()** | We print a results table and averages. If pandas analysis is needed later, results are just a list of dicts — trivial to add. |
-| **Tracing/cost tracking** | Records every LLM call (prompt, response, latency). Useful for debugging weird scores, but we see individual scores as they print. Cost tracking requires a `token_usage_parser` we never set up. |
-| **Sophisticated retries (tenacity)** | `evaluate()` uses tenacity with jitter + `max_wait`. Our `sleep(2^attempt)` with 3 retries covers transient API blips. For a single-user eval against one endpoint, jitter doesn't matter — no thundering herd. |
-
-## What we get from the manual loop
-
-- Visible per-metric, per-sample progress
-- Full control over concurrency (`Semaphore(10)`)
-- Simple retry with exponential backoff (3 attempts)
-- Direct access to results as list of dicts
+| **EvaluationDataset validation** | `gather_responses.py` guarantees correct fields. Missing fields surface immediately at scoring time. |
+| **EvaluationResult with .to_pandas()** | We print a results table and averages. Trivial to add later. |
+| **Tracing/cost tracking** | We see individual scores as they print. No `token_usage_parser` set up. |
+| **Tenacity retries** | Our `sleep(2^attempt)` with 3 retries covers transient API blips for a single-user eval. |
 
 ---
 
